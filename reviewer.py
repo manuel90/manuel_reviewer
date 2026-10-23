@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import threading
@@ -67,53 +68,105 @@ def send_slack_message(text: str) -> bool:
         print(f"⚠️ Exception sending Slack text message: {e}")
         return False
 
-def send_slack_approval_request(repo: str, pr_number: int, pr_title: str, diff_url: str, commit_sha: str) -> bool:
-    """Sends an interactive Slack message with Approve/Reject buttons."""
-    webhook_url = os.getenv("SLACK_WEBHOOK_URL") or SLACK_WEBHOOK_URL
-    target_user = os.getenv("TARGET_ASSIGNEE") or TARGET_ASSIGNEE or "Unassigned"
+# Regex to match GitHub PR URLs (e.g. in forwarded notification emails)
+PR_URL_REGEX = re.compile(r"https://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)/pull/(\d+)")
 
-    payload = {
-        "text": f"🚨 *AI PR Review Approval Requested for PR #{pr_number}*",
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Repository:* {repo}\n*PR #{pr_number}:* {pr_title}\n*Assigned to:* {target_user}"
-                }
-            },
-            {
-                "type": "actions",
-                "block_id": "review_approval_block",
-                "elements": [
-                    {
-                        "type": "button",
-                        "action_id": "approve_ai_review",
-                        "text": {"type": "plain_text", "text": "✅ Approve AI Review"},
-                        "style": "primary",
-                        "value": json.dumps({
-                            "action": "approve",
-                            "repo": repo,
-                            "pr_number": pr_number,
-                            "diff_url": diff_url,
-                            "commit_sha": commit_sha
-                        })
-                    },
-                    {
-                        "type": "button",
-                        "action_id": "reject_ai_review",
-                        "text": {"type": "plain_text", "text": "❌ Reject"},
-                        "style": "danger",
-                        "value": json.dumps({"action": "reject", "pr_number": pr_number})
-                    }
-                ]
+def extract_pr_links(text: str) -> list[tuple[str, int]]:
+    """Extracts unique (repo, pr_number) pairs from text or stringified Slack payloads."""
+    if not text:
+        return []
+    matches = PR_URL_REGEX.findall(text)
+    seen = set()
+    result = []
+    for repo, num_str in matches:
+        pr_num = int(num_str)
+        key = (repo, pr_num)
+        if key not in seen:
+            seen.add(key)
+            result.append(key)
+    return result
+
+def fetch_github_pr_details(repo: str, pr_number: int) -> dict:
+    """Fetches title, commit sha, and diff url for a PR from the GitHub API."""
+    github_token = os.getenv("GITHUB_TOKEN") or GITHUB_TOKEN
+    headers = {
+        "Accept": "application/vnd.github.v3+json"
+    }
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+
+    api_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
+    try:
+        r = requests.get(api_url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return {
+                "title": data.get("title", f"PR #{pr_number}"),
+                "diff_url": data.get("diff_url", f"https://github.com/{repo}/pull/{pr_number}.diff"),
+                "commit_sha": data.get("head", {}).get("sha", "HEAD"),
+                "state": data.get("state", "open")
             }
-        ]
+    except Exception as e:
+        print(f"⚠️ Error fetching PR #{pr_number} metadata from GitHub: {e}")
+
+    return {
+        "title": f"PR #{pr_number}",
+        "diff_url": f"https://api.github.com/repos/{repo}/pulls/{pr_number}.diff",
+        "commit_sha": "HEAD",
+        "state": "open"
     }
 
+def build_approval_blocks(repo: str, pr_number: int, pr_title: str, diff_url: str, commit_sha: str) -> list[dict]:
+    """Generates standard Slack Block Kit blocks for AI PR review approval."""
+    target_user = os.getenv("TARGET_ASSIGNEE") or TARGET_ASSIGNEE or "Unassigned"
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Repository:* {repo}\n*PR #{pr_number}:* {pr_title}\n*Assigned to:* {target_user}"
+            }
+        },
+        {
+            "type": "actions",
+            "block_id": "review_approval_block",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "approve_ai_review",
+                    "text": {"type": "plain_text", "text": "✅ Approve AI Review"},
+                    "style": "primary",
+                    "value": json.dumps({
+                        "action": "approve",
+                        "repo": repo,
+                        "pr_number": pr_number,
+                        "diff_url": diff_url,
+                        "commit_sha": commit_sha
+                    })
+                },
+                {
+                    "type": "button",
+                    "action_id": "reject_ai_review",
+                    "text": {"type": "plain_text", "text": "❌ Reject"},
+                    "style": "danger",
+                    "value": json.dumps({"action": "reject", "pr_number": pr_number})
+                }
+            ]
+        }
+    ]
+
+def send_slack_approval_request(repo: str, pr_number: int, pr_title: str, diff_url: str, commit_sha: str) -> bool:
+    """Sends an interactive Slack message with Approve/Reject buttons via webhook."""
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL") or SLACK_WEBHOOK_URL
     if not webhook_url:
         print("❌ Failed to send Slack notification: SLACK_WEBHOOK_URL is not set.")
         return False
+
+    blocks = build_approval_blocks(repo, pr_number, pr_title, diff_url, commit_sha)
+    payload = {
+        "text": f"🚨 *AI PR Review Approval Requested for PR #{pr_number}*",
+        "blocks": blocks
+    }
 
     try:
         res = requests.post(webhook_url, json=payload, timeout=10)
@@ -381,6 +434,65 @@ async def slack_interactive(payload: str = Form(...)):
 bolt_app = None
 socket_mode_handler = None
 
+_handled_slack_messages = set()
+
+def handle_incoming_slack_pr_message(event: dict, say, client=None):
+    """
+    Listens to incoming Slack messages (including forwarded GitHub notification emails),
+    extracts GitHub PR links, fetches PR metadata, and replies with approval prompt buttons.
+    """
+    subtype = event.get("subtype")
+    if subtype in ["message_deleted", "message_changed"]:
+        return
+
+    # Convert event payload to string to search across text, attachments, and email snippets
+    raw_event_str = json.dumps(event)
+
+    # Ignore messages sent by our bot (prevent loop)
+    if "review_approval_block" in raw_event_str or "approve_ai_review" in raw_event_str:
+        return
+
+    pr_links = extract_pr_links(raw_event_str)
+    if not pr_links:
+        return
+
+    channel = event.get("channel")
+    message_ts = event.get("ts")
+    thread_ts = event.get("thread_ts") or message_ts
+
+    for repo, pr_number in pr_links:
+        msg_key = f"{channel}_{message_ts}_{repo}_{pr_number}"
+        if msg_key in _handled_slack_messages:
+            continue
+        _handled_slack_messages.add(msg_key)
+
+        print(f"\n📨 Detected GitHub PR in Slack message: {repo} #{pr_number}")
+        pr_info = fetch_github_pr_details(repo, pr_number)
+        blocks = build_approval_blocks(
+            repo=repo,
+            pr_number=pr_number,
+            pr_title=pr_info["title"],
+            diff_url=pr_info["diff_url"],
+            commit_sha=pr_info["commit_sha"]
+        )
+
+        try:
+            say(
+                blocks=blocks,
+                text=f"🚨 AI PR Review Approval Requested for {repo} #{pr_number}",
+                thread_ts=thread_ts
+            )
+            print(f"✅ Dispatched approval buttons into Slack thread for {repo} #{pr_number}!")
+        except Exception as e:
+            print(f"⚠️ Failed to reply in Slack thread: {e}. Trying direct message...")
+            try:
+                say(
+                    blocks=blocks,
+                    text=f"🚨 AI PR Review Approval Requested for {repo} #{pr_number}"
+                )
+            except Exception as e2:
+                print(f"❌ Failed to dispatch message to Slack: {e2}")
+
 def init_slack_bolt():
     global bolt_app
     bot_token = os.getenv("SLACK_BOT_TOKEN") or SLACK_BOT_TOKEN
@@ -413,6 +525,10 @@ def init_slack_bolt():
                     respond(err_msg, replace_original=False)
                 except Exception:
                     pass
+
+        @bolt_app.event("message")
+        def handle_message_events(event, say, client):
+            handle_incoming_slack_pr_message(event, say, client)
 
         return bolt_app
     except Exception as e:

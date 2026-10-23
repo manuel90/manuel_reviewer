@@ -49,9 +49,10 @@ When a Pull Request is opened, updated, assigned, or review-requested on GitHub,
 
 ## ✨ Features
 
+- **Slack Email & Chat Listener**: Automatically detects GitHub PR links from forwarded GitHub notification emails (or team messages) in Slack, fetching PR metadata and replying directly in the thread with interactive Approve/Reject buttons.
 - **Reviewer & Assignee Filtering**: Only triggers reviews when a specific GitHub username (`TARGET_ASSIGNEE`) is assigned to the PR or requested as a reviewer (`review_requested`).
 - **Human-in-the-Loop Slack Gate**: Prevents wasteful or unwanted AI reviews by requiring approval via interactive Slack buttons.
-- **Slack Socket Mode**: Uses WebSockets (`wss://`) for button interactions. **No ngrok or public IP is required for local development.**
+- **Slack Socket Mode**: Uses WebSockets (`wss://`) for button interactions and real-time message listening. **No ngrok or public IP is required for local development.**
 - **Curated Code Review Rules**:
   - Analyzes critical logic flaws breaking functionality.
   - Flags any debug logging statements (`console.log`, `print`, etc.).
@@ -104,8 +105,20 @@ SLACK_BOT_TOKEN="xoxb-..."
 1. Go to [api.slack.com/apps](https://api.slack.com/apps) and select your app.
 2. **Enable Socket Mode**: Go to **Socket Mode** in the left sidebar and toggle **Enable Socket Mode** to **ON**.
 3. **App-Level Token (`xapp-...`)**: Under **Basic Information** → **App-Level Tokens**, click **Generate Token and Scopes**, add the **`connections:write`** scope, and copy the token into `SLACK_APP_TOKEN`.
-4. **Bot Token (`xoxb-...`)**: Under **OAuth & Permissions** → **Bot Token Scopes**, add `chat:write` and install the app to your workspace. Copy the **Bot User OAuth Token** into `SLACK_BOT_TOKEN`.
-5. **Incoming Webhook**: Under **Incoming Webhooks**, toggle **ON**, click **Add New Webhook to Workspace**, select your channel, and copy the URL into `SLACK_WEBHOOK_URL`.
+4. **Bot Token Scopes (`xoxb-...`)**: Under **OAuth & Permissions** → **Bot Token Scopes**, add:
+   - `chat:write` (to post confirmation prompts and error alerts)
+   - `channels:history` (to listen to public channel messages / forwarded emails)
+   - `groups:history` (optional: if listening in private channels)
+   Install or reinstall the app to your workspace. Copy the **Bot User OAuth Token** into `SLACK_BOT_TOKEN`.
+5. **Event Subscriptions (for detecting forwarded GitHub emails)**:
+   - Go to **Event Subscriptions** in the left sidebar and toggle **Enable Events** to **ON**.
+   - Under **Subscribe to bot events**, add **`message.channels`** (and/or `message.groups`).
+   - Click **Save Changes** and reinstall your app if prompted.
+6. **Incoming Webhook**: Under **Incoming Webhooks**, toggle **ON**, click **Add New Webhook to Workspace**, select your channel, and copy the URL into `SLACK_WEBHOOK_URL`.
+7. **Channel Invite**: Invite your bot into the Slack channel where your GitHub emails arrive:
+   ```text
+   /invite @YourBotName
+   ```
 
 ---
 
@@ -223,7 +236,7 @@ Send the interactive approval prompt straight to Slack without needing the local
 
 ## 🧪 Automated Tests
 
-The test suite contains 22 comprehensive unit and integration tests covering all endpoints, Slack formatting, Gemini review, and simulation flows.
+The test suite contains 26 comprehensive unit and integration tests covering all endpoints, Slack formatting, Gemini review, Slack email/message PR link detection, and simulation flows.
 
 Run all tests:
 

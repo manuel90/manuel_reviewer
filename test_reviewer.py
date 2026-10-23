@@ -460,3 +460,95 @@ def test_slack_interactive_github_diff_error_sends_to_slack():
         # Verify error dispatched to Slack
         mock_slack_send.assert_called_once()
         assert "PR #100" in mock_slack_send.call_args[0][0]
+
+
+# ==========================================
+# Tests for Slack Email / Message PR Detection
+# ==========================================
+
+def test_extract_pr_links():
+    from reviewer import extract_pr_links
+    
+    # Test text containing an email snippet
+    text = (
+        "Subject: [GitHub] [test-org/test-repo] Review requested: #123 New feature\n"
+        "View it on GitHub:\n"
+        "<https://github.com/test-org/test-repo/pull/123>\n"
+        "And another PR: https://github.com/test-org/another-repo/pull/456\n"
+        "Duplicate: https://github.com/test-org/test-repo/pull/123"
+    )
+    links = extract_pr_links(text)
+    assert len(links) == 2
+    assert links[0] == ("test-org/test-repo", 123)
+    assert links[1] == ("test-org/another-repo", 456)
+
+
+def test_fetch_github_pr_details():
+    from reviewer import fetch_github_pr_details
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "title": "Add OAuth support",
+        "diff_url": "https://github.com/test-org/test-repo/pull/123.diff",
+        "head": {"sha": "sha_live_123"},
+        "state": "open"
+    }
+
+    with patch("requests.get", return_value=mock_resp):
+        info = fetch_github_pr_details("test-org/test-repo", 123)
+        assert info["title"] == "Add OAuth support"
+        assert info["diff_url"] == "https://github.com/test-org/test-repo/pull/123.diff"
+        assert info["commit_sha"] == "sha_live_123"
+
+
+def test_handle_incoming_slack_pr_message_posts_thread_reply():
+    from reviewer import handle_incoming_slack_pr_message
+
+    mock_say = MagicMock()
+    mock_pr_info = {
+        "title": "Fix memory leak",
+        "diff_url": "https://github.com/test-org/test-repo/pull/55.diff",
+        "commit_sha": "sha_leak_55",
+        "state": "open"
+    }
+
+    event = {
+        "type": "message",
+        "channel": "C123456",
+        "ts": "1700000000.123456",
+        "text": "Review requested: https://github.com/test-org/test-repo/pull/55"
+    }
+
+    with patch("reviewer.fetch_github_pr_details", return_value=mock_pr_info):
+        handle_incoming_slack_pr_message(event, mock_say)
+
+        mock_say.assert_called_once()
+        kwargs = mock_say.call_args[1]
+        assert kwargs["thread_ts"] == "1700000000.123456"
+        assert "blocks" in kwargs
+        blocks = kwargs["blocks"]
+        assert "test-org/test-repo" in blocks[0]["text"]["text"]
+        assert "55" in blocks[0]["text"]["text"]
+        assert "Fix memory leak" in blocks[0]["text"]["text"]
+
+
+def test_handle_incoming_slack_pr_message_ignores_bot_or_empty():
+    from reviewer import handle_incoming_slack_pr_message
+
+    mock_say = MagicMock()
+
+    # Case 1: Message with review_approval_block (sent by bot itself)
+    event_bot = {
+        "text": "Here is approval prompt",
+        "blocks": [{"block_id": "review_approval_block"}]
+    }
+    handle_incoming_slack_pr_message(event_bot, mock_say)
+    mock_say.assert_not_called()
+
+    # Case 2: Message without any GitHub PR links
+    event_no_pr = {
+        "text": "Hello world, no link here!"
+    }
+    handle_incoming_slack_pr_message(event_no_pr, mock_say)
+    mock_say.assert_not_called()
